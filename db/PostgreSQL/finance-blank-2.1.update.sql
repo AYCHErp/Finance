@@ -532,91 +532,6 @@ LANGUAGE plpgsql;
 --     ''
 -- );
 
--->-->-- src/Frapid.Web/Areas/MixERP.Finance/db/PostgreSQL/2.1.update/src/02.functions-and-logic/finance.get_net_profit.sql --<--<--
-DROP FUNCTION IF EXISTS finance.get_net_profit
-(
-    _date_from                      date,
-    _date_to                        date,
-    _office_id                      integer,
-    _factor                         integer,
-    _no_provison                    boolean
-);
-
-CREATE FUNCTION finance.get_net_profit
-(
-    _date_from                      date,
-    _date_to                        date,
-    _office_id                      integer,
-    _factor                         integer,
-    _no_provison                    boolean DEFAULT false
-)
-RETURNS numeric(30, 6)
-AS
-$$
-    DECLARE _incomes                numeric(30, 6) = 0;
-    DECLARE _expenses               numeric(30, 6) = 0;
-    DECLARE _profit_before_tax      numeric(30, 6) = 0;
-    DECLARE _tax_paid               numeric(30, 6) = 0;
-    DECLARE _tax_provison           numeric(30, 6) = 0;
-    DECLARE _periods                finance.period[];
-    DECLARE _start                  date;
-    DECLARE _end                    date;
-BEGIN
-    _periods            := finance.get_periods(_date_from, _date_to);
-
-    WITH periods
-    AS
-    (
-        SELECT date_from AS date
-        FROM explode_array(_periods)
-        UNION ALL
-        SELECT date_to AS date
-        FROM explode_array(_periods)
-    )
-    SELECT 
-        MIN(date), 
-        MAX(date)
-    INTO
-        _start,
-        _end
-    FROM periods;
-
-    SELECT SUM(CASE tran_type WHEN 'Cr' THEN amount_in_local_currency ELSE amount_in_local_currency * -1 END)
-    INTO _incomes
-    FROM finance.verified_transaction_mat_view
-    WHERE value_date >= _start AND value_date <= _end
-    AND office_id IN (SELECT * FROM core.get_office_ids(_office_id))
-    AND account_master_id >=20100
-    AND account_master_id <= 20350;
-    
-    SELECT SUM(CASE tran_type WHEN 'Dr' THEN amount_in_local_currency ELSE amount_in_local_currency * -1 END)
-    INTO _expenses
-    FROM finance.verified_transaction_mat_view
-    WHERE value_date >= _start AND value_date <= _end
-    AND office_id IN (SELECT * FROM core.get_office_ids(_office_id))
-    AND account_master_id >=20400
-    AND account_master_id < 20800;
-    
-    SELECT SUM(CASE tran_type WHEN 'Dr' THEN amount_in_local_currency ELSE amount_in_local_currency * -1 END)
-    INTO _tax_paid
-    FROM finance.verified_transaction_mat_view
-    WHERE value_date >= _start AND value_date <= _end
-    AND office_id IN (SELECT * FROM core.get_office_ids(_office_id))
-    AND account_master_id =20800;
-    
-    _profit_before_tax := COALESCE(_incomes, 0) - COALESCE(_expenses, 0);
-
-    IF(_no_provison) THEN
-        RETURN (_profit_before_tax - COALESCE(_tax_paid, 0)) / _factor;
-    END IF;
-    
-    _tax_provison      := finance.get_income_tax_provison_amount(_office_id, _profit_before_tax, COALESCE(_tax_paid, 0));
-    
-    RETURN (_profit_before_tax - (COALESCE(_tax_provison, 0) + COALESCE(_tax_paid, 0))) / _factor;
-END
-$$
-LANGUAGE plpgsql;
-
 -->-->-- src/Frapid.Web/Areas/MixERP.Finance/db/PostgreSQL/2.1.update/src/02.functions-and-logic/finance.get_new_transaction_counter.sql --<--<--
 DROP FUNCTION IF EXISTS finance.get_new_transaction_counter(date);
 
@@ -1238,124 +1153,6 @@ END
 $$
 LANGUAGE plpgsql;
 
--->-->-- src/Frapid.Web/Areas/MixERP.Finance/db/PostgreSQL/2.1.update/src/02.functions-and-logic/logic/finance.get_trial_balance_tree.sql --<--<--
-DROP FUNCTION IF EXISTS finance.get_trial_balance_tree
-(
-    _date_from                      date,
-    _date_to                        date,
-    _user_id                        integer,
-    _office_id                      integer,
-    _factor                         numeric(30, 6),
-    _change_side_when_negative      boolean
-);
-
-CREATE FUNCTION finance.get_trial_balance_tree
-(
-    _date_from                      date,
-    _date_to                        date,
-    _user_id                        integer,
-    _office_id                      integer,
-    _factor                         numeric(30, 6),
-    _change_side_when_negative      boolean DEFAULT(true)
-)
-RETURNS TABLE
-(
-    id                      integer,
-    account_id              integer,
-    account_number          text,
-    account                 text,
-    previous_debit          numeric(30, 6),
-    previous_credit         numeric(30, 6),
-    debit                   numeric(30, 6),
-    credit                  numeric(30, 6),
-    closing_debit           numeric(30, 6),
-    closing_credit          numeric(30, 6),
-    parent_account_id       integer
-)
-AS
-$$
-BEGIN
-    DROP TABLE IF EXISTS temp_trial_balance_tree;
-    CREATE TEMPORARY TABLE temp_trial_balance_tree
-    (
-        id                      integer,
-        account_id              integer,
-        account_number          text,
-        account                 text,
-        previous_debit          numeric(30, 6),
-        previous_credit         numeric(30, 6),
-        debit                   numeric(30, 6),
-        credit                  numeric(30, 6),
-        closing_debit           numeric(30, 6),
-        closing_credit          numeric(30, 6),
-        root_account_id         integer,
-        normally_debit          boolean,
-        parent_account_id       integer
-    ) ON COMMIT DROP;
-
-    INSERT INTO temp_trial_balance_tree
-    SELECT * FROM finance.get_trial_balance(_date_from, _date_to, _user_id, _office_id, false, _factor, _change_side_when_negative, true);
-
-    UPDATE temp_trial_balance_tree
-    SET parent_account_id = finance.accounts.parent_account_id
-    FROM finance.accounts
-    WHERE finance.accounts.account_id = temp_trial_balance_tree.account_id;
-
-    INSERT INTO temp_trial_balance_tree(account_id, account_number, account, parent_account_id)
-    SELECT
-        finance.accounts.account_id,
-        finance.accounts.account_number,
-        finance.accounts.account_name,
-        finance.accounts.parent_account_id
-    FROM finance.accounts
-    WHERE finance.accounts.account_id NOT IN
-    (
-        SELECT temp_trial_balance_tree.account_id
-        FROM temp_trial_balance_tree
-    );
-
-    RETURN QUERY
-    SELECT
-        row_number() OVER(ORDER BY temp_trial_balance_tree.account_id)::integer AS id,
-        temp_trial_balance_tree.account_id,
-        temp_trial_balance_tree.account_number,
-        temp_trial_balance_tree.account,
-        temp_trial_balance_tree.previous_debit,
-        temp_trial_balance_tree.previous_credit,
-        temp_trial_balance_tree.debit,
-        temp_trial_balance_tree.credit,
-        temp_trial_balance_tree.closing_debit,
-        temp_trial_balance_tree.closing_credit,
-        temp_trial_balance_tree.parent_account_id
-    FROM temp_trial_balance_tree;
-END
-$$
-LANGUAGE plpgsql;
-
--- WITH result
--- AS
--- (
-    -- SELECT
-        -- account_id AS "accountId",
-        -- account_number AS "accountNumber",
-        -- REPLACE(account, '&', '&amp;') AS "title",
-        -- previous_debit AS "previousDebit",
-        -- previous_credit AS "previousCredit",
-        -- debit AS "debit",
-        -- credit AS "credit",
-        -- closing_debit AS "closingDebit",
-        -- closing_credit AS "closingCredit",
-        -- parent_account_id AS "parentAccountId"
-    -- FROM finance.get_trial_balance_tree('1-1-2000', '1-1-2020', 1, 1, 1, false)
--- )
--- SELECT * FROM result;
-
-
--->-->-- src/Frapid.Web/Areas/MixERP.Finance/db/PostgreSQL/2.1.update/src/03.menus/menus.sql --<--<--
-SELECT * FROM core.create_app('MixERP.Finance', 'Finance', 'Finance', '2.1', 'MixERP Inc.', 'October 10, 2018', 'book red', '/dashboard/finance/tasks/console', NULL::text[]);
-SELECT * FROM core.create_menu('MixERP.Finance', 'TrialBalanceTree', 'Trial Balance Tree', '/dashboard/reports/view/Areas/MixERP.Finance/Reports/TreeTrialBalance.xml', 'signal', 'Reports');
-
-
 -->-->-- src/Frapid.Web/Areas/MixERP.Finance/db/PostgreSQL/2.1.update/src/04.default-values/01.default-values.sql --<--<--
 UPDATE finance.accounts
 SET account_master_id = finance.get_account_master_id_by_account_master_code('ACP')
@@ -1396,17 +1193,6 @@ LANGUAGE plpgsql;
 
 
 -->-->-- src/Frapid.Web/Areas/MixERP.Finance/db/PostgreSQL/2.1.update/src/05.selector-views/empty.sql --<--<--
-
-
--->-->-- src/Frapid.Web/Areas/MixERP.Finance/db/PostgreSQL/2.1.update/src/05.selector-views/finance.report_account_selector_view.sql --<--<--
-DROP VIEW IF EXISTS finance.report_account_selector_view;
-
-CREATE VIEW finance.report_account_selector_view
-AS
-SELECT
-    finance.accounts.account_id AS report_account_id,
-    finance.get_account_name_by_account_id(finance.accounts.account_id) AS report_account_name
-FROM finance.accounts WHERE parent_account_id IS NOT NULL ORDER BY 1;
 
 
 -->-->-- src/Frapid.Web/Areas/MixERP.Finance/db/PostgreSQL/2.1.update/src/05.views/empty.sql --<--<--
@@ -1472,25 +1258,41 @@ LANGUAGE plpgsql;
 DO
 $$
     DECLARE this record;
+    DECLARE _version_number integer = current_setting('server_version_num')::integer;
 BEGIN
     IF(CURRENT_USER = 'frapid_db_user') THEN
         RETURN;
     END IF;
 
-    FOR this IN 
-    SELECT 'ALTER '
-        || CASE WHEN p.proisagg THEN 'AGGREGATE ' ELSE 'FUNCTION ' END
-        || quote_ident(n.nspname) || '.' || quote_ident(p.proname) || '(' 
-        || pg_catalog.pg_get_function_identity_arguments(p.oid) || ') OWNER TO frapid_db_user;' AS sql
-    FROM   pg_catalog.pg_proc p
-    JOIN   pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-    WHERE  NOT n.nspname = ANY(ARRAY['pg_catalog', 'information_schema'])
-    LOOP        
-        EXECUTE this.sql;
-    END LOOP;
+    IF(_version_number < 110000) THEN
+        FOR this IN 
+        SELECT 'ALTER '
+            || CASE WHEN p.proisagg THEN 'AGGREGATE ' ELSE 'FUNCTION ' END
+            || quote_ident(n.nspname) || '.' || quote_ident(p.proname) || '(' 
+            || pg_catalog.pg_get_function_identity_arguments(p.oid) || ') OWNER TO frapid_db_user;' AS sql
+        FROM   pg_catalog.pg_proc p
+        JOIN   pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+        WHERE  NOT n.nspname = ANY(ARRAY['pg_catalog', 'information_schema'])
+        LOOP        
+            EXECUTE this.sql;
+        END LOOP;
+    ELSE
+        FOR this IN 
+        SELECT 'ALTER '
+            || CASE p.prokind WHEN 'a' THEN 'AGGREGATE ' ELSE 'FUNCTION ' END
+            || quote_ident(n.nspname) || '.' || quote_ident(p.proname) || '(' 
+            || pg_catalog.pg_get_function_identity_arguments(p.oid) || ') OWNER TO frapid_db_user;' AS sql
+        FROM   pg_catalog.pg_proc p
+        JOIN   pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+        WHERE  NOT n.nspname = ANY(ARRAY['pg_catalog', 'information_schema'])
+        LOOP        
+            EXECUTE this.sql;
+        END LOOP;
+    END IF;
 END
 $$
 LANGUAGE plpgsql;
+
 
 
 DO
@@ -1599,22 +1401,37 @@ LANGUAGE plpgsql;
 DO
 $$
     DECLARE this record;
+    DECLARE _version_number integer = current_setting('server_version_num')::integer;
 BEGIN
     IF(CURRENT_USER = 'report_user') THEN
         RETURN;
     END IF;
 
-    FOR this IN 
-    SELECT 'GRANT EXECUTE ON '
-        || CASE WHEN p.proisagg THEN 'AGGREGATE ' ELSE 'FUNCTION ' END
-        || quote_ident(n.nspname) || '.' || quote_ident(p.proname) || '(' 
-        || pg_catalog.pg_get_function_identity_arguments(p.oid) || ') TO report_user;' AS sql
-    FROM   pg_catalog.pg_proc p
-    JOIN   pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-    WHERE  NOT n.nspname = ANY(ARRAY['pg_catalog', 'information_schema'])
-    LOOP        
-        EXECUTE this.sql;
-    END LOOP;
+    IF(_version_number < 110000) THEN
+        FOR this IN 
+        SELECT 'GRANT EXECUTE ON '
+            || CASE WHEN p.proisagg THEN 'AGGREGATE ' ELSE 'FUNCTION ' END
+            || quote_ident(n.nspname) || '.' || quote_ident(p.proname) || '(' 
+            || pg_catalog.pg_get_function_identity_arguments(p.oid) || ') TO report_user;' AS sql
+        FROM   pg_catalog.pg_proc p
+        JOIN   pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+        WHERE  NOT n.nspname = ANY(ARRAY['pg_catalog', 'information_schema'])
+        LOOP        
+            EXECUTE this.sql;
+        END LOOP;
+    ELSE
+        FOR this IN 
+        SELECT 'GRANT EXECUTE ON '
+            || CASE p.prokind WHEN 'a' THEN 'AGGREGATE ' ELSE 'FUNCTION ' END
+            || quote_ident(n.nspname) || '.' || quote_ident(p.proname) || '(' 
+            || pg_catalog.pg_get_function_identity_arguments(p.oid) || ') TO report_user;' AS sql
+        FROM   pg_catalog.pg_proc p
+        JOIN   pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+        WHERE  NOT n.nspname = ANY(ARRAY['pg_catalog', 'information_schema'])
+        LOOP        
+            EXECUTE this.sql;
+        END LOOP;
+    END IF;
 END
 $$
 LANGUAGE plpgsql;
